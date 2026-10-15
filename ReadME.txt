@@ -1,0 +1,1 @@
+pip install easyocr customtkinter pillow pdfplumber pdf2image opencv-python pandas openpyxl numpy pyautogui
