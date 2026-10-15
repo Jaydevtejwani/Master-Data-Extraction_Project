@@ -14,26 +14,28 @@ import pyautogui
 import cv2
 import numpy as np
 import pandas as pd
-import pypdfium2 as pdfium  # Pure Python PDF renderer replacing PyMuPDF
+import pdfplumber
+import pypdfium2 as pdfium  # Replaced pdf2image with pypdfium2 (No Poppler required!)
 import easyocr
-import torch
 
 # Configure CustomTkinter Theme
 ctk.set_appearance_mode("Dark")
 ctk.set_default_color_theme("blue")
 
-# Auto-detect GPU acceleration
-USE_GPU = torch.cuda.is_available()
-print(f"Initializing Deep Learning Engine (EasyOCR GPU Acceleration = {USE_GPU})...")
-
-# Load EasyOCR neural engine globally
-EASYOCR_READER = easyocr.Reader(['en'], gpu=USE_GPU)
+# Initialize Deep Learning EasyOCR Engine once at startup
+print("Initializing Deep Learning OCR Engine (EasyOCR)...")
+EASYOCR_READER = easyocr.Reader(['en'], gpu=False)
 
 
 # =========================================================
-# HIGH-SPEED OPTIMIZED PRE-PROCESSING ENGINE
+# NON-DESTRUCTIVE DEEP LEARNING PRE-PROCESSING ENGINE
 # =========================================================
 class AdvancedImagePreprocessor:
+    """
+    Clean pre-processor that enhances contrast and sharpens camera/screenshot text
+    without eroding character stems or creating pixel artifacts.
+    """
+
     @staticmethod
     def assess_and_enhance(cv_img: np.ndarray, attempt_stage: int = 1) -> np.ndarray:
         if len(cv_img.shape) == 3:
@@ -41,35 +43,37 @@ class AdvancedImagePreprocessor:
         else:
             gray = cv_img.copy()
 
+        # 1. Moderate Upscaling to Preserve Character Geometry
         h, w = gray.shape[:2]
-
-        max_dim = 1600 if attempt_stage == 1 else 2000
-        if max(h, w) > max_dim:
-            scale = max_dim / float(max(h, w))
-            gray = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
-        elif max(h, w) < 800:
-            scale = 1200.0 / float(max(h, w))
+        if h < 1200 or w < 1200:
+            scale = 2.0 if attempt_stage == 1 else 2.5
             gray = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
 
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        # 2. CLAHE Contrast Normalization
+        clip = 2.0 if attempt_stage == 1 else 3.5
+        clahe = cv2.createCLAHE(clipLimit=clip, tileGridSize=(8, 8))
         enhanced = clahe.apply(gray)
+
+        # 3. Non-Destructive Sharpening Filter for Camera Focus Blur
+        if attempt_stage >= 2:
+            kernel = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]])
+            enhanced = cv2.filter2D(enhanced, -1, kernel)
 
         return enhanced
 
 
 # =========================================================
-# DEEP LEARNING EASYOCR SPATIAL TABLE EXTRACTOR
+# NEURAL NETWORK SPATIAL TABLE EXTRACTOR (EASYOCR)
 # =========================================================
 class SpatialTableExtractor:
+    """
+    Uses EasyOCR neural recognition to detect bounding boxes and text,
+    then spatially clusters words into horizontal rows and vertical columns.
+    """
+
     @staticmethod
     def extract_grid(cv_img: np.ndarray, page_num: int = 1, attempt_stage: int = 1) -> pd.DataFrame:
-        results = EASYOCR_READER.readtext(
-            cv_img, 
-            detail=1, 
-            paragraph=False,
-            canvas_size=1280,
-            batch_size=4 if USE_GPU else 1
-        )
+        results = EASYOCR_READER.readtext(cv_img, detail=1, paragraph=False)
 
         if not results:
             df = pd.DataFrame([["[No Data Extracted]", ""]])
@@ -103,7 +107,7 @@ class SpatialTableExtractor:
         rows = []
         current_row = []
         last_y = None
-        y_tolerance = 16.0 if attempt_stage == 1 else 12.0
+        y_tolerance = 18.0 if attempt_stage == 1 else 14.0
 
         for word in words_data:
             if last_y is None or abs(word["y"] - last_y) <= y_tolerance:
@@ -133,6 +137,8 @@ class SpatialTableExtractor:
 
         cols = [f"Extracted_Col_{i+1}" for i in range(max_cols)]
         df = pd.DataFrame(padded_matrix, columns=cols)
+        
+        # Insert Page Number header as first column
         df.insert(0, "Page_Number", page_num)
         return df
 
@@ -377,7 +383,7 @@ class MasterDataExtractorApp(ctk.CTk):
     # ------------------------------------------
     def trigger_windows_snipping_tool(self):
         self.iconify()
-        time.sleep(0.4)
+        time.sleep(0.5)
 
         pyautogui.hotkey('win', 'shift', 's')
         threading.Thread(target=self._poll_clipboard_for_snip, daemon=True).start()
@@ -390,7 +396,7 @@ class MasterDataExtractorApp(ctk.CTk):
         captured_img = None
 
         while time.time() - start_time < max_wait:
-            time.sleep(0.3)
+            time.sleep(0.5)
             current_clipboard = ImageGrab.grabclipboard()
             if isinstance(current_clipboard, Image.Image):
                 captured_img = current_clipboard
@@ -402,7 +408,7 @@ class MasterDataExtractorApp(ctk.CTk):
             self._update_status("Snipping Tool cancelled or timed out.", 0.0)
             return
 
-        self._update_status("Processing Snipping Tool Capture...", 0.7)
+        self._update_status("Processing Snipping Tool Capture with EasyOCR...", 0.7)
 
         cv_img = cv2.cvtColor(np.array(captured_img.convert('RGB')), cv2.COLOR_RGB2BGR)
 
@@ -412,7 +418,7 @@ class MasterDataExtractorApp(ctk.CTk):
         snip_filename = f"Snip_{int(time.time())}.png"
         snip_key = (snip_filename, 1)
         self.extracted_data_store[snip_key] = {
-            "df": df, "attempt": 1, "approved": False, "track": "EasyOCR Deep Learning"
+            "df": df, "attempt": 1, "approved": False, "track": "EasyOCR (Deep Learning)"
         }
 
         self.current_file = snip_filename
@@ -492,15 +498,22 @@ class MasterDataExtractorApp(ctk.CTk):
 
     def _process_pdf_file(self, fpath):
         try:
-            pdf = pdfium.PdfDocument(fpath)
-            for page_idx in range(len(pdf)):
-                page_num = page_idx + 1
-                self._process_scanned_pdf_page(fpath, page_num)
-            pdf.close()
+            with pdfplumber.open(fpath) as pdf:
+                for page_idx, page in enumerate(pdf.pages):
+                    page_num = page_idx + 1
+                    tables = page.extract_tables()
+                    if tables and len(tables[0]) > 0:
+                        df = pd.DataFrame(tables[0][1:], columns=tables[0][0])
+                        df.insert(0, "Page_Number", page_num)
+                        self.extracted_data_store[(fpath, page_num)] = {
+                            "df": df, "attempt": 1, "approved": False, "track": "Digital PDF"
+                        }
+                    else:
+                        self._process_scanned_pdf_page(fpath, page_num)
         except Exception:
             self._process_scanned_pdf_page(fpath, 1)
 
-    # Pure Python PDF renderer passed directly into EasyOCR
+    # NO POPPLER NEEDED: Uses pypdfium2 to convert PDF pages directly to images in memory
     def _process_scanned_pdf_page(self, fpath, page_num):
         pdf = pdfium.PdfDocument(fpath)
         page = pdf[page_num - 1]
@@ -606,6 +619,7 @@ class MasterDataExtractorApp(ctk.CTk):
         self._render_left_media()
         self._render_right_table()
 
+    # NO POPPLER NEEDED: Uses pypdfium2 to render UI page previews cleanly
     def _render_left_media(self):
         if self.current_file and self.current_file.startswith("Snip_") and self.clipboard_pil_img:
             pil_img = self.clipboard_pil_img.copy()
@@ -670,7 +684,7 @@ class MasterDataExtractorApp(ctk.CTk):
             self._load_document_view()
 
     # ------------------------------------------
-    # EXPORT MASTER EXCEL
+    # EXPORT MASTER EXCEL (CRASH-PROOF SINGLE SHEET PER DOC)
     # ------------------------------------------
     def export_master_excel(self):
         if not self.extracted_data_store:
@@ -679,6 +693,7 @@ class MasterDataExtractorApp(ctk.CTk):
 
         master_excel_path = os.path.join(self.output_dir, "Master_Extracted_Data.xlsx")
         try:
+            # Group extracted pages by document file path
             grouped_docs = {}
             for (fpath, page_num), entry in self.extracted_data_store.items():
                 if fpath not in grouped_docs:
@@ -687,12 +702,14 @@ class MasterDataExtractorApp(ctk.CTk):
 
             with pd.ExcelWriter(master_excel_path, engine="openpyxl") as writer:
                 for fpath, pages_data in grouped_docs.items():
+                    # Sort pages sequentially by page number
                     pages_data.sort(key=lambda x: x[0])
                     
                     cleaned_dfs = []
                     for page_num, df in pages_data:
                         df_copy = df.copy()
                         
+                        # Fix Duplicate Columns: Ensure all column headers are unique strings
                         cols = []
                         col_count = {}
                         for col in df_copy.columns:
@@ -706,9 +723,13 @@ class MasterDataExtractorApp(ctk.CTk):
                         df_copy.columns = cols
                         cleaned_dfs.append(df_copy)
                     
+                    # Combine all page DataFrames safely
                     combined_df = pd.concat(cleaned_dfs, axis=0, ignore_index=True, sort=False)
+                    
+                    # Fill any empty missing cells from mismatched column counts with empty string
                     combined_df = combined_df.fillna("")
                     
+                    # Generate a clean sheet title from the document filename (max 31 chars)
                     fname = os.path.basename(fpath)
                     sheet_title = re.sub(r'[:\*\\/1\?\[\]]', '_', fname)[:31]
                     
