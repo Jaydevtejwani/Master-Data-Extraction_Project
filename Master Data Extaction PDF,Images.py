@@ -15,7 +15,7 @@ import cv2
 import numpy as np
 import pandas as pd
 import pdfplumber
-import pypdfium2 as pdfium  # Replaced pdf2image with pypdfium2 (No Poppler required!)
+import pypdfium2 as pdfium  # Zero Poppler dependency
 import easyocr
 
 # Configure CustomTkinter Theme
@@ -28,12 +28,12 @@ EASYOCR_READER = easyocr.Reader(['en'], gpu=False)
 
 
 # =========================================================
-# NON-DESTRUCTIVE DEEP LEARNING PRE-PROCESSING ENGINE
+# ENHANCED NOISE-FREE PRE-PROCESSING ENGINE
 # =========================================================
 class AdvancedImagePreprocessor:
     """
-    Clean pre-processor that enhances contrast and sharpens camera/screenshot text
-    without eroding character stems or creating pixel artifacts.
+    Cleans background noise, sharpens text, and adjusts resolution
+    to prevent EasyOCR from reading background artifacts as garbage text.
     """
 
     @staticmethod
@@ -43,18 +43,22 @@ class AdvancedImagePreprocessor:
         else:
             gray = cv_img.copy()
 
-        # 1. Moderate Upscaling to Preserve Character Geometry
         h, w = gray.shape[:2]
-        if h < 1200 or w < 1200:
+
+        # 1. Upscale for Small or Low-DPI Text
+        if h < 1500 or w < 1500:
             scale = 2.0 if attempt_stage == 1 else 2.5
             gray = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
 
-        # 2. CLAHE Contrast Normalization
-        clip = 2.0 if attempt_stage == 1 else 3.5
-        clahe = cv2.createCLAHE(clipLimit=clip, tileGridSize=(8, 8))
-        enhanced = clahe.apply(gray)
+        # 2. Denoising Filter (Removes compression speckles & artifacts)
+        denoised = cv2.fastNlMeansDenoising(gray, h=10, templateWindowSize=7, searchWindowSize=21)
 
-        # 3. Non-Destructive Sharpening Filter for Camera Focus Blur
+        # 3. Dynamic Contrast Normalization
+        clip = 2.5 if attempt_stage == 1 else 4.0
+        clahe = cv2.createCLAHE(clipLimit=clip, tileGridSize=(8, 8))
+        enhanced = clahe.apply(denoised)
+
+        # 4. Sharpening Filter for Camera Focus Blur
         if attempt_stage >= 2:
             kernel = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]])
             enhanced = cv2.filter2D(enhanced, -1, kernel)
@@ -63,17 +67,23 @@ class AdvancedImagePreprocessor:
 
 
 # =========================================================
-# NEURAL NETWORK SPATIAL TABLE EXTRACTOR (EASYOCR)
+# CLEAN SPATIAL TABLE EXTRACTOR (WITH GARBAGE FILTER)
 # =========================================================
 class SpatialTableExtractor:
     """
-    Uses EasyOCR neural recognition to detect bounding boxes and text,
-    then spatially clusters words into horizontal rows and vertical columns.
+    Filters low-confidence noise and spatially clusters words into clean rows.
     """
 
     @staticmethod
     def extract_grid(cv_img: np.ndarray, page_num: int = 1, attempt_stage: int = 1) -> pd.DataFrame:
-        results = EASYOCR_READER.readtext(cv_img, detail=1, paragraph=False)
+        results = EASYOCR_READER.readtext(
+            cv_img, 
+            detail=1, 
+            paragraph=False,
+            min_size=10,        # Ignores tiny dust spots/speckles
+            text_threshold=0.5, # Ignores faint background noise
+            low_text=0.3
+        )
 
         if not results:
             df = pd.DataFrame([["[No Data Extracted]", ""]])
@@ -83,7 +93,13 @@ class SpatialTableExtractor:
         words_data = []
         for bbox, text, confidence in results:
             text_str = text.strip()
-            if not text_str or confidence < 0.15:
+
+            # FILTER 1: Drop very low confidence predictions
+            if confidence < 0.20:
+                continue
+
+            # FILTER 2: Drop standalone random single symbols (e.g., `,`, `~`, `'`, `\`)
+            if len(text_str) == 1 and not text_str.isalnum() and text_str not in ["$", "€", "£", "%", "|", "-", "/", "."]:
                 continue
 
             min_x = min(pt[0] for pt in bbox)
@@ -107,7 +123,7 @@ class SpatialTableExtractor:
         rows = []
         current_row = []
         last_y = None
-        y_tolerance = 18.0 if attempt_stage == 1 else 14.0
+        y_tolerance = 14.0 if attempt_stage == 1 else 10.0
 
         for word in words_data:
             if last_y is None or abs(word["y"] - last_y) <= y_tolerance:
@@ -129,7 +145,7 @@ class SpatialTableExtractor:
                 parts = [p.strip() for p in row_text.split("|")]
                 table_matrix.append(parts)
             else:
-                split_parts = re.split(r'\s{3,}', row_text)
+                split_parts = re.split(r'\s{2,}', row_text)
                 table_matrix.append(split_parts)
 
         max_cols = max(len(r) for r in table_matrix) if table_matrix else 1
@@ -138,7 +154,6 @@ class SpatialTableExtractor:
         cols = [f"Extracted_Col_{i+1}" for i in range(max_cols)]
         df = pd.DataFrame(padded_matrix, columns=cols)
         
-        # Insert Page Number header as first column
         df.insert(0, "Page_Number", page_num)
         return df
 
@@ -513,11 +528,11 @@ class MasterDataExtractorApp(ctk.CTk):
         except Exception:
             self._process_scanned_pdf_page(fpath, 1)
 
-    # NO POPPLER NEEDED: Uses pypdfium2 to convert PDF pages directly to images in memory
+    # Uses pypdfium2 (No Poppler required)
     def _process_scanned_pdf_page(self, fpath, page_num):
         pdf = pdfium.PdfDocument(fpath)
         page = pdf[page_num - 1]
-        pil_image = page.render(scale=2).to_pil()
+        pil_image = page.render(scale=2.5).to_pil()
         
         cv_img = cv2.cvtColor(np.array(pil_image.convert("RGB")), cv2.COLOR_RGB2BGR)
         enhanced = AdvancedImagePreprocessor.assess_and_enhance(cv_img, attempt_stage=1)
@@ -561,7 +576,7 @@ class MasterDataExtractorApp(ctk.CTk):
                 if ext == ".pdf":
                     pdf = pdfium.PdfDocument(fpath)
                     page = pdf[self.current_page - 1]
-                    pil_image = page.render(scale=2).to_pil()
+                    pil_image = page.render(scale=2.5).to_pil()
                     cv_img = cv2.cvtColor(np.array(pil_image.convert("RGB")), cv2.COLOR_RGB2BGR)
                     pdf.close()
                 else:
@@ -619,7 +634,6 @@ class MasterDataExtractorApp(ctk.CTk):
         self._render_left_media()
         self._render_right_table()
 
-    # NO POPPLER NEEDED: Uses pypdfium2 to render UI page previews cleanly
     def _render_left_media(self):
         if self.current_file and self.current_file.startswith("Snip_") and self.clipboard_pil_img:
             pil_img = self.clipboard_pil_img.copy()
@@ -693,7 +707,6 @@ class MasterDataExtractorApp(ctk.CTk):
 
         master_excel_path = os.path.join(self.output_dir, "Master_Extracted_Data.xlsx")
         try:
-            # Group extracted pages by document file path
             grouped_docs = {}
             for (fpath, page_num), entry in self.extracted_data_store.items():
                 if fpath not in grouped_docs:
@@ -702,14 +715,12 @@ class MasterDataExtractorApp(ctk.CTk):
 
             with pd.ExcelWriter(master_excel_path, engine="openpyxl") as writer:
                 for fpath, pages_data in grouped_docs.items():
-                    # Sort pages sequentially by page number
                     pages_data.sort(key=lambda x: x[0])
                     
                     cleaned_dfs = []
                     for page_num, df in pages_data:
                         df_copy = df.copy()
                         
-                        # Fix Duplicate Columns: Ensure all column headers are unique strings
                         cols = []
                         col_count = {}
                         for col in df_copy.columns:
@@ -723,13 +734,9 @@ class MasterDataExtractorApp(ctk.CTk):
                         df_copy.columns = cols
                         cleaned_dfs.append(df_copy)
                     
-                    # Combine all page DataFrames safely
                     combined_df = pd.concat(cleaned_dfs, axis=0, ignore_index=True, sort=False)
-                    
-                    # Fill any empty missing cells from mismatched column counts with empty string
                     combined_df = combined_df.fillna("")
                     
-                    # Generate a clean sheet title from the document filename (max 31 chars)
                     fname = os.path.basename(fpath)
                     sheet_title = re.sub(r'[:\*\\/1\?\[\]]', '_', fname)[:31]
                     
