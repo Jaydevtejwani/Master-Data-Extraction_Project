@@ -14,8 +14,7 @@ import pyautogui
 import cv2
 import numpy as np
 import pandas as pd
-import pdfplumber
-import fitz  # PyMuPDF (Zero external dependencies / No Poppler required)
+import pypdfium2 as pdfium  # Pure Python PDF renderer replacing PyMuPDF
 import easyocr
 import torch
 
@@ -23,11 +22,11 @@ import torch
 ctk.set_appearance_mode("Dark")
 ctk.set_default_color_theme("blue")
 
-# Auto-detect GPU for hardware acceleration
+# Auto-detect GPU acceleration
 USE_GPU = torch.cuda.is_available()
 print(f"Initializing Deep Learning Engine (EasyOCR GPU Acceleration = {USE_GPU})...")
 
-# Initialize EasyOCR once globally
+# Load EasyOCR neural engine globally
 EASYOCR_READER = easyocr.Reader(['en'], gpu=USE_GPU)
 
 
@@ -35,11 +34,6 @@ EASYOCR_READER = easyocr.Reader(['en'], gpu=USE_GPU)
 # HIGH-SPEED OPTIMIZED PRE-PROCESSING ENGINE
 # =========================================================
 class AdvancedImagePreprocessor:
-    """
-    Optimized pre-processor that resizes large documents down to an optimal size
-    for fast neural network inference while preserving contrast.
-    """
-
     @staticmethod
     def assess_and_enhance(cv_img: np.ndarray, attempt_stage: int = 1) -> np.ndarray:
         if len(cv_img.shape) == 3:
@@ -64,14 +58,9 @@ class AdvancedImagePreprocessor:
 
 
 # =========================================================
-# FAST NEURAL NETWORK SPATIAL TABLE EXTRACTOR
+# DEEP LEARNING EASYOCR SPATIAL TABLE EXTRACTOR
 # =========================================================
 class SpatialTableExtractor:
-    """
-    Uses EasyOCR neural recognition to detect bounding boxes and text,
-    then spatially clusters words into horizontal rows and vertical columns.
-    """
-
     @staticmethod
     def extract_grid(cv_img: np.ndarray, page_num: int = 1, attempt_stage: int = 1) -> pd.DataFrame:
         results = EASYOCR_READER.readtext(
@@ -214,7 +203,7 @@ class FileSelectionModal(ctk.CTkToplevel):
 class MasterDataExtractorApp(ctk.CTk):
     def __init__(self):
         super().__init__()
-        self.title("Master Data Extraction — PyMuPDF & EasyOCR Engine")
+        self.title("Master Data Extraction — Deep Learning EasyOCR Engine")
         self.geometry("1400x850")
 
         self.input_dir = ""
@@ -423,7 +412,7 @@ class MasterDataExtractorApp(ctk.CTk):
         snip_filename = f"Snip_{int(time.time())}.png"
         snip_key = (snip_filename, 1)
         self.extracted_data_store[snip_key] = {
-            "df": df, "attempt": 1, "approved": False, "track": "EasyOCR (Fast)"
+            "df": df, "attempt": 1, "approved": False, "track": "EasyOCR Deep Learning"
         }
 
         self.current_file = snip_filename
@@ -503,38 +492,28 @@ class MasterDataExtractorApp(ctk.CTk):
 
     def _process_pdf_file(self, fpath):
         try:
-            with pdfplumber.open(fpath) as pdf:
-                for page_idx, page in enumerate(pdf.pages):
-                    page_num = page_idx + 1
-                    tables = page.extract_tables()
-                    if tables and len(tables[0]) > 0:
-                        df = pd.DataFrame(tables[0][1:], columns=tables[0][0])
-                        df.insert(0, "Page_Number", page_num)
-                        self.extracted_data_store[(fpath, page_num)] = {
-                            "df": df, "attempt": 1, "approved": False, "track": "Digital PDF"
-                        }
-                    else:
-                        self._process_scanned_pdf_page(fpath, page_num)
+            pdf = pdfium.PdfDocument(fpath)
+            for page_idx in range(len(pdf)):
+                page_num = page_idx + 1
+                self._process_scanned_pdf_page(fpath, page_num)
+            pdf.close()
         except Exception:
             self._process_scanned_pdf_page(fpath, 1)
 
+    # Pure Python PDF renderer passed directly into EasyOCR
     def _process_scanned_pdf_page(self, fpath, page_num):
-        doc = fitz.open(fpath)
-        page = doc.load_page(page_num - 1)
-        pix = page.get_pixmap(dpi=200)
+        pdf = pdfium.PdfDocument(fpath)
+        page = pdf[page_num - 1]
+        pil_image = page.render(scale=2).to_pil()
         
-        cv_img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, pix.n)
-        if pix.n == 4:
-            cv_img = cv2.cvtColor(cv_img, cv2.COLOR_RGBA2BGR)
-        elif pix.n == 3:
-            cv_img = cv2.cvtColor(cv_img, cv2.COLOR_RGB2BGR)
-
+        cv_img = cv2.cvtColor(np.array(pil_image.convert("RGB")), cv2.COLOR_RGB2BGR)
         enhanced = AdvancedImagePreprocessor.assess_and_enhance(cv_img, attempt_stage=1)
         df = SpatialTableExtractor.extract_grid(enhanced, page_num=page_num, attempt_stage=1)
+        
         self.extracted_data_store[(fpath, page_num)] = {
             "df": df, "attempt": 1, "approved": False, "track": "EasyOCR (Scanned PDF)"
         }
-        doc.close()
+        pdf.close()
 
     def _process_image_file(self, fpath):
         cv_img = cv2.imread(fpath)
@@ -567,15 +546,11 @@ class MasterDataExtractorApp(ctk.CTk):
             else:
                 ext = os.path.splitext(fpath)[1].lower()
                 if ext == ".pdf":
-                    doc = fitz.open(fpath)
-                    page = doc.load_page(self.current_page - 1)
-                    pix = page.get_pixmap(dpi=200)
-                    cv_img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, pix.n)
-                    if pix.n == 4:
-                        cv_img = cv2.cvtColor(cv_img, cv2.COLOR_RGBA2BGR)
-                    elif pix.n == 3:
-                        cv_img = cv2.cvtColor(cv_img, cv2.COLOR_RGB2BGR)
-                    doc.close()
+                    pdf = pdfium.PdfDocument(fpath)
+                    page = pdf[self.current_page - 1]
+                    pil_image = page.render(scale=2).to_pil()
+                    cv_img = cv2.cvtColor(np.array(pil_image.convert("RGB")), cv2.COLOR_RGB2BGR)
+                    pdf.close()
                 else:
                     cv_img = cv2.imread(fpath)
 
@@ -619,9 +594,9 @@ class MasterDataExtractorApp(ctk.CTk):
         ext = os.path.splitext(self.current_file)[1].lower()
         if ext == ".pdf":
             try:
-                doc = fitz.open(self.current_file)
-                self.total_pages = len(doc)
-                doc.close()
+                pdf = pdfium.PdfDocument(self.current_file)
+                self.total_pages = len(pdf)
+                pdf.close()
             except Exception:
                 self.total_pages = 1
         else:
@@ -642,11 +617,10 @@ class MasterDataExtractorApp(ctk.CTk):
         ext = os.path.splitext(self.current_file)[1].lower()
         try:
             if ext == ".pdf":
-                doc = fitz.open(self.current_file)
-                page = doc.load_page(self.current_page - 1)
-                pix = page.get_pixmap(dpi=150)
-                pil_img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-                doc.close()
+                pdf = pdfium.PdfDocument(self.current_file)
+                page = pdf[self.current_page - 1]
+                pil_img = page.render(scale=1.5).to_pil()
+                pdf.close()
             else:
                 pil_img = Image.open(self.current_file)
 
@@ -696,7 +670,7 @@ class MasterDataExtractorApp(ctk.CTk):
             self._load_document_view()
 
     # ------------------------------------------
-    # EXPORT MASTER EXCEL (CRASH-PROOF SINGLE SHEET PER DOC)
+    # EXPORT MASTER EXCEL
     # ------------------------------------------
     def export_master_excel(self):
         if not self.extracted_data_store:
